@@ -1,0 +1,30 @@
+# ============================================================
+# Job Autopilot — Production Dependencies
+# ============================================================
+
+# HTTP client (modern, async-capable replacement for requests)
+httpx>=0.27.0
+
+# Data validation and settings
+pydantic>=2.7.0
+pydantic-settings>=2.3.0
+
+# Web framework + ASGI server
+fastapi>=0.111.0
+uvicorn[standard]>=0.30.0
+
+# CLI framework
+typer>=0.12.0
+
+# Structured logging
+structlog>=24.1.0
+
+# File locking for safe concurrent JSON writes
+filelock>=3.15.0
+
+# Environment variables from .env files
+python-dotenv>=1.0.0
+
+# LLM clients (we'll use these in Phase 2)
+openai>=1.30.0
+anthropic>=0.30.0
