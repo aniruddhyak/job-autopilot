@@ -5,13 +5,13 @@ from __future__ import annotations
 import asyncio
 import json
 from datetime import datetime, timezone
-from pathlib import Path
 
 import structlog
 import typer
 
 from job_autopilot import __version__
 from job_autopilot.discover import WorkdaySource
+from job_autopilot.filters import apply_scrape_filter, load_filters
 from job_autopilot.logging_config import configure_logging
 from job_autopilot.models import RawJob, SourcesConfig
 from job_autopilot.settings import settings
@@ -40,7 +40,6 @@ def _load_sources_config() -> SourcesConfig:
             err=True,
         )
         raise typer.Exit(code=1)
-
     raw = json.loads(path.read_text(encoding="utf-8"))
     return SourcesConfig.model_validate(raw)
 
@@ -85,25 +84,56 @@ def version() -> None:
 
 
 @app.command()
+def status() -> None:
+    """Show current data status (job count, paths)."""
+    raw = settings.raw_jobs_file
+    if raw.exists():
+        try:
+            data = json.loads(raw.read_text(encoding="utf-8"))
+            print_total = f"  Jobs in raw_jobs.json: {len(data)}"
+            with_jd = sum(1 for j in data if j.get("description"))
+            typer.echo(print_total)
+            typer.echo(f"  With JD:               {with_jd}")
+        except Exception:
+            typer.echo("  raw_jobs.json: present but unreadable")
+    else:
+        typer.echo("  raw_jobs.json: not found (run `discover` first)")
+    typer.echo(f"  Data dir:  {settings.data_dir}")
+    typer.echo(f"  Config:    {settings.config_dir}")
+
+
+@app.command()
 def discover(
     max_per_org: int = typer.Option(
-        None,
-        "--max-per-org",
-        "-m",
+        None, "--max-per-org", "-m",
         help="Cap jobs scraped per company (default: no cap).",
     ),
-    fetch_details: bool = typer.Option(
-        False,
-        "--details/--no-details",
-        help="Also fetch full job descriptions (slower).",
+    list_only: bool = typer.Option(
+        False, "--list-only",
+        help="Skip JD enrichment (faster; no description/qualifications).",
     ),
     dry_run: bool = typer.Option(
-        False,
-        "--dry-run",
+        False, "--dry-run",
         help="Scrape but don't write to raw_jobs.json.",
     ),
+    location: list[str] = typer.Option(
+        None, "--location", "-l",
+        help="Override location filter (repeat flag). E.g., -l usa -l remote",
+    ),
+    no_filter: bool = typer.Option(
+        False, "--no-filter",
+        help="Bypass config/filters.json and keep every scraped job.",
+    ),
+    max_age: int = typer.Option(
+        None, "--max-age", "-a",
+        help="Override max age in days (e.g., -a 2 keeps last 2 days).",
+    ),
+    polite_delay: float = typer.Option(
+        0.1, "--polite-delay",
+        help="Seconds between detail fetches (default: 0.1).",
+    ),
 ) -> None:
-    """Discover jobs from configured sources and update data/raw_jobs.json."""
+    """Discover jobs: list scrape -> filter -> JD enrichment -> save."""
     configure_logging(settings.log_level)
 
     cfg = _load_sources_config()
@@ -127,33 +157,99 @@ def discover(
     source = WorkdaySource(
         orgs=workday_orgs,
         max_jobs_per_org=max_per_org,
-        fetch_details=fetch_details,
+        fetch_details=False,           # we'll enrich manually after filtering
+        polite_delay=polite_delay,
     )
 
+    # -------- 1. List scrape --------
     try:
         jobs: list[RawJob] = asyncio.run(source.discover())
-    except Exception as exc:  # pragma: no cover — defensive
-        logger.error("discover_failed", error=str(exc), error_type=type(exc).__name__)
+    except Exception as exc:  # pragma: no cover
+        logger.error(
+            "discover_failed",
+            error=str(exc),
+            error_type=type(exc).__name__,
+        )
         typer.secho(f"❌ Discovery failed: {exc}", fg=typer.colors.RED, err=True)
         _record_run(
             sources=["workday"],
-            discovered=0,
-            added=0,
-            updated=0,
+            discovered=0, added=0, updated=0,
             duration_sec=(datetime.now(timezone.utc) - started).total_seconds(),
-            ok=False,
-            error=str(exc),
+            ok=False, error=str(exc),
         )
         raise typer.Exit(code=1) from exc
 
-    duration = (datetime.now(timezone.utc) - started).total_seconds()
+    list_duration = (datetime.now(timezone.utc) - started).total_seconds()
     typer.secho(
-        f"\n✓ Scraped {len(jobs)} job(s) in {duration:.1f}s.",
+        f"\n✓ Listed {len(jobs)} job(s) in {list_duration:.1f}s.",
         fg=typer.colors.GREEN,
     )
 
+    # -------- 2. Apply filters --------
+    if no_filter:
+        kept_jobs = jobs
+        typer.secho("⚙  Filters bypassed (--no-filter)", fg=typer.colors.YELLOW)
+    else:
+        filters_config = load_filters(settings.config_dir)
+        override_locations = list(location) if location else None
+        kept_jobs, stats = apply_scrape_filter(
+            jobs,
+            filters_config,
+            override_location_ids=override_locations,
+            override_max_age_days=max_age,
+        )
+        if stats["filters_off"]:
+            typer.secho(
+                "⚙  Filters disabled in config (scrape_filter.enabled=false)",
+                fg=typer.colors.YELLOW,
+            )
+        else:
+            typer.secho(
+                f"🔎 Filtered: kept {stats['kept']}/{stats['input']} "
+                f"(loc:{stats['dropped_loc']} title:{stats['dropped_title']} "
+                f"age:{stats['dropped_age']})",
+                fg=typer.colors.CYAN,
+            )
+
+    # -------- 3. Enrich with JD (default: yes) --------
+    if list_only:
+        typer.secho("📄 Skipping JD enrichment (--list-only)", fg=typer.colors.YELLOW)
+        enriched_jobs = kept_jobs
+    elif kept_jobs:
+        typer.secho(
+            f"📄 Fetching JDs for {len(kept_jobs)} job(s)...",
+            fg=typer.colors.CYAN,
+        )
+        enrich_started = datetime.now(timezone.utc)
+        try:
+            enriched_jobs = asyncio.run(source.enrich_details(kept_jobs))
+            enrich_duration = (
+                datetime.now(timezone.utc) - enrich_started
+            ).total_seconds()
+            with_jd = sum(1 for j in enriched_jobs if j.description)
+            typer.secho(
+                f"✓ Enriched {with_jd}/{len(enriched_jobs)} with JD "
+                f"in {enrich_duration:.1f}s.",
+                fg=typer.colors.GREEN,
+            )
+        except Exception as exc:
+            logger.error("enrich_failed", error=str(exc))
+            typer.secho(
+                f"⚠ Enrichment failed: {exc} — saving without JD",
+                fg=typer.colors.YELLOW,
+            )
+            enriched_jobs = kept_jobs
+    else:
+        enriched_jobs = kept_jobs
+
+    duration = (datetime.now(timezone.utc) - started).total_seconds()
+
+    # -------- 4. Save --------
     if dry_run:
-        typer.secho("(dry run — not writing raw_jobs.json)", fg=typer.colors.YELLOW)
+        typer.secho(
+            "(dry run — not writing raw_jobs.json)",
+            fg=typer.colors.YELLOW,
+        )
         _record_run(
             sources=["workday"],
             discovered=len(jobs),
@@ -164,16 +260,16 @@ def discover(
         )
         return
 
-    # Persist
     settings.data_dir.mkdir(parents=True, exist_ok=True)
     added, updated = upsert_models_by_id(
         settings.raw_jobs_file,
-        jobs,
+        enriched_jobs,
         model=RawJob,
     )
 
     typer.secho(
-        f"💾 Saved to {settings.raw_jobs_file}: +{added} new, ~{updated} updated.",
+        f"💾 Saved to {settings.raw_jobs_file}: "
+        f"+{added} new, ~{updated} updated. (total {duration:.1f}s)",
         fg=typer.colors.GREEN,
     )
 
@@ -186,17 +282,17 @@ def discover(
         ok=True,
     )
 
-    # Pretty per-company breakdown
     by_company: dict[str, int] = {}
-    for j in jobs:
+    for j in enriched_jobs:
         by_company[j.company_display] = by_company.get(j.company_display, 0) + 1
-    typer.echo("\n📊 Per-company:")
-    for name, count in sorted(by_company.items(), key=lambda kv: -kv[1]):
-        typer.echo(f"   {name:20s} {count}")
+    if by_company:
+        typer.echo("\n📊 Per-company (after filtering):")
+        for name, count in sorted(by_company.items(), key=lambda kv: -kv[1]):
+            typer.echo(f"   {name:20s} {count}")
 
 
 # ----------------------------------------------------------------------
-# Entry point: ``python -m job_autopilot.cli`` → runs Typer
+# Entry point
 # ----------------------------------------------------------------------
 
 def main() -> None:

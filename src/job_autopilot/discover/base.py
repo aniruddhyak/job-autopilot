@@ -21,7 +21,6 @@ import structlog
 
 from job_autopilot.models import RawJob
 
-# A module-level logger that all subclasses can use directly.
 logger = structlog.get_logger(__name__)
 
 
@@ -30,14 +29,12 @@ logger = structlog.get_logger(__name__)
 # ----------------------------------------------------------------------
 
 DEFAULT_TIMEOUT = 15.0
-"""Per-request timeout in seconds."""
 
 DEFAULT_USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/124.0 Safari/537.36"
 )
-"""Pretend to be a regular browser — most ATS APIs accept this fine."""
 
 DEFAULT_HEADERS: dict[str, str] = {
     "Accept": "application/json",
@@ -51,13 +48,8 @@ DEFAULT_HEADERS: dict[str, str] = {
 # ----------------------------------------------------------------------
 
 class DiscoverySource(ABC):
-    """Abstract base for all discovery sources.
+    """Abstract base for all discovery sources."""
 
-    Subclasses must implement ``discover()``. They may also override
-    ``_default_headers`` if a particular ATS needs special headers.
-    """
-
-    #: Subclasses set this — used in ``RawJob.source`` and in logs.
     source_name: str = "base"
 
     def __init__(
@@ -68,14 +60,6 @@ class DiscoverySource(ABC):
         fetch_details: bool = False,
         polite_delay: float = 0.0,
     ) -> None:
-        """Initialize the source.
-
-        Args:
-            timeout: Per-HTTP-request timeout in seconds.
-            max_jobs_per_org: Cap on jobs per organization (``None`` = no cap).
-            fetch_details: If ``True``, fetch full job descriptions (slower).
-            polite_delay: Sleep time (s) between detail requests to avoid throttling.
-        """
         self.timeout = timeout
         self.max_jobs_per_org = max_jobs_per_org
         self.fetch_details = fetch_details
@@ -97,21 +81,13 @@ class DiscoverySource(ABC):
         ...
 
     # ------------------------------------------------------------------
-    # Shared helpers (subclasses can use these but don't have to)
+    # Shared helpers
     # ------------------------------------------------------------------
 
     def _default_headers(self) -> dict[str, str]:
-        """Default HTTP headers. Override if a source needs special headers."""
         return dict(DEFAULT_HEADERS)
 
     def _build_client(self) -> httpx.AsyncClient:
-        """Create a configured async HTTP client.
-
-        Subclasses can call this from inside ``discover()`` like:
-
-            async with self._build_client() as client:
-                ...
-        """
         return httpx.AsyncClient(
             timeout=self.timeout,
             headers=self._default_headers(),
@@ -119,7 +95,6 @@ class DiscoverySource(ABC):
         )
 
     async def _polite_pause(self) -> None:
-        """Sleep ``polite_delay`` seconds (no-op if 0)."""
         if self.polite_delay > 0:
             await asyncio.sleep(self.polite_delay)
 
@@ -144,13 +119,21 @@ async def run_sources(sources: Iterable[DiscoverySource]) -> list[RawJob]:
             jobs = await src.discover()
             src.log.info("source_done", count=len(jobs))
             return jobs
-        except Exception as exc:  # pragma: no cover — defensive
-            src.log.error("source_failed", error=str(exc), error_type=type(exc).__name__)
+        except Exception as exc:  # pragma: no cover
+            src.log.error(
+                "source_failed",
+                error=str(exc),
+                error_type=type(exc).__name__,
+            )
             return []
 
     results = await asyncio.gather(*(_safe_run(s) for s in sources_list))
     merged: list[RawJob] = []
     for r in results:
         merged.extend(r)
-    logger.info("run_sources_complete", total_jobs=len(merged), source_count=len(sources_list))
+    logger.info(
+        "run_sources_complete",
+        total_jobs=len(merged),
+        source_count=len(sources_list),
+    )
     return merged

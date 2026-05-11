@@ -1,0 +1,78 @@
+{
+  "__comment": "Sample filters configuration. Copy to filters.json and edit to match your job search criteria. Filters apply at scrape time: jobs that fail any filter are dropped before storage. Used by both the CLI and dashboard refresh.",
+
+  "scrape_filter": {
+    "enabled": true,
+    "max_age_days": 7,
+
+    "location_ids": ["north_carolina", "arizona", "austin"],
+
+    "title_includes": [
+      "engineer", "developer", "software", "architect",
+      "data scientist", "ml engineer", "ai engineer",
+      "principal", "staff", "lead", "senior"
+    ],
+
+    "title_excludes": [
+      "intern", "internship", "co-op", "apprentice",
+      "sales", "sales engineer", "account executive",
+      "recruiter", "marketing",
+      "field engineer", "support engineer", "customer engineer",
+      "pre-sales", "presales"
+    ]
+  },
+
+  "locations": [
+    {
+      "id": "north_carolina",
+      "label": "North Carolina",
+      "matchAny": [
+        "raleigh", "rtp", "research triangle",
+        "charlotte", "durham", "cary",
+        "greensboro", "winston-salem", "chapel hill",
+        "north carolina", " nc "
+      ]
+    },
+    {
+      "id": "arizona",
+      "label": "Arizona",
+      "matchAny": [
+        "phoenix", "tempe", "scottsdale", "tucson",
+        "mesa", "chandler", "gilbert",
+        "arizona", " az "
+      ]
+    },
+    {
+      "id": "austin",
+      "label": "Austin",
+      "matchAny": ["austin"]
+    },
+    {
+      "id": "san_jose",
+      "label": "San Jose",
+      "matchAny": ["san jose", "sunnyvale", "santa clara", "mountain view"]
+    },
+    {
+      "id": "remote_us",
+      "label": "Remote (US)",
+      "matchAny": ["remote", "anywhere", "us remote", "remote us"]
+    }
+  ],
+
+  "__schema_help": {
+    "scrape_filter.enabled": "Master switch. false = keep everything (no filtering).",
+    "scrape_filter.max_age_days": "Drop jobs posted more than N days ago. Workday provides 'Posted Today / Yesterday / N Days Ago'.",
+    "scrape_filter.location_ids": "Array of location IDs (see 'locations' section). A job passes if it matches ANY ID.",
+    "scrape_filter.title_includes": "Case-insensitive substrings. Job title must contain at least one. Empty = no requirement.",
+    "scrape_filter.title_excludes": "Case-insensitive substrings. Job title must contain NONE. Empty = no exclusion.",
+    "locations[].id": "Unique identifier referenced in 'location_ids' and used in CLI --location flag.",
+    "locations[].label": "Display name shown in the dashboard's location dropdown.",
+    "locations[].matchAny": "Case-insensitive substrings. A job's location string must contain at least one."
+  },
+
+  "__cli_overrides": [
+    "Override location for one run: python -m job_autopilot discover --location remote_us",
+    "Override max-age for one run:  python -m job_autopilot discover --max-age 14",
+    "Bypass all filters:            python -m job_autopilot discover --no-filter"
+  ]
+}

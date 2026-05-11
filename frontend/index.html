@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Job Autopilot</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+  <link rel="preconnect" href="https://rsms.me/" />
+  <link rel="stylesheet" href="https://rsms.me/inter/inter.css" />
+</head>
+<body>
+  <div class="app">
+    <!-- Header -->
+    <header class="header">
+      <div class="header-inner">
+        <h1 class="brand">Job Autopilot</h1>
+        <button id="refresh-btn" class="btn btn-primary">
+          <span class="btn-label">Refresh</span>
+          <span class="btn-spinner" hidden>Refreshing…</span>
+        </button>
+      </div>
+    </header>
+
+    <!-- Hero / Stats -->
+    <section id="hero" class="hero">
+      <!-- populated by JS -->
+    </section>
+
+    <!-- Main content area (router renders here) -->
+    <main id="view" class="view">
+      <div class="loading">Loading…</div>
+    </main>
+
+    <!-- Footer -->
+    <footer class="footer">
+      <span class="muted">Job Autopilot · v0.1.0</span>
+    </footer>
+  </div>
+
+  <!-- Toast for inline notifications -->
+  <div id="toast" class="toast" hidden></div>
+
+  <script src="/static/app.js" type="module"></script>
+</body>
+</html>

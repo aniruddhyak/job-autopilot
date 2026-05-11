@@ -50,6 +50,7 @@ class RawJob(BaseModel):
 
     # --- Detail fields (populated only when fetch_details=True) ---
     description: str | None = Field(None, description="Full job description (HTML or plain).")
+    description_text: str | None = Field(None, description="Plain-text version of description.")
     qualifications: str | None = Field(None, description="Required qualifications.")
     responsibilities: str | None = Field(None, description="Job responsibilities.")
     remote_type: str | None = Field(None, description="Onsite / Hybrid / Remote.")

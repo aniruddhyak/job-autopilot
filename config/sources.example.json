@@ -1,0 +1,55 @@
+{
+  "__comment": "Sample sources configuration. Copy to sources.json and edit to match the companies you want to track. The 'workday' array supports the Workday CXS public job listings API. Adding a company = adding one entry here.",
+
+  "workday": [
+    {
+      "company": "cisco",
+      "display_name": "Cisco",
+      "site": "Cisco_Careers",
+      "num": 5,
+      "enabled": true,
+      "tags": ["networking", "infrastructure"],
+      "priority": "high",
+      "note": "Found at cisco.wd5.myworkdayjobs.com/Cisco_Careers"
+    },
+    {
+      "company": "paypal",
+      "display_name": "PayPal",
+      "site": "jobs",
+      "num": 1,
+      "enabled": true,
+      "tags": ["fintech"],
+      "priority": "high",
+      "note": ""
+    },
+    {
+      "company": "nvidia",
+      "display_name": "NVIDIA",
+      "site": "NVIDIAExternalCareerSite",
+      "num": 5,
+      "enabled": false,
+      "tags": ["ai", "ml", "hardware"],
+      "priority": "high",
+      "note": "Enable when ready to expand to AI/ML roles"
+    }
+  ],
+
+  "__schema_help": {
+    "company": "URL slug for the tenant. Find in the careers URL: {company}.wd{num}.myworkdayjobs.com",
+    "display_name": "Human-readable name shown in the dashboard.",
+    "site": "Site path from the URL. E.g., 'Cisco_Careers' from .../en-US/Cisco_Careers",
+    "num": "Workday tenant number from the URL (1-99). E.g., 'wd5' -> 5.",
+    "enabled": "Toggle scraping for this tenant. Disabled tenants are skipped.",
+    "tags": "Free-form labels for grouping. Used in future analytics.",
+    "priority": "'high' | 'medium' | 'low'. Affects scoring weight in Phase 2.",
+    "note": "Free-text notes for yourself."
+  },
+
+  "__how_to_find_a_tenant": [
+    "1. Go to the company's careers page (e.g., careers.example.com).",
+    "2. Click 'Search Jobs' or any job listing.",
+    "3. If the browser URL becomes {something}.wd{N}.myworkdayjobs.com/en-US/{Site} -> it's a Workday tenant.",
+    "4. Parse the URL: company={something}, num={N}, site={Site}.",
+    "5. Add the entry to your sources.json."
+  ]
+}
