@@ -57,6 +57,18 @@ class Settings(BaseSettings):
     @property
     def runs_file(self) -> Path:
         return self.data_dir / "runs.json"
+    
+    @property
+    def resume_file(self) -> Path:
+        """Path to the resume markdown used for LLM scoring.
+
+        Defaults to data/resume_scoring.md (a trimmed scoring-only version),
+        falling back to data/resume.md if the scoring-specific file doesn't exist.
+        """
+        scoring = self.data_dir / "resume_scoring.md"
+        if scoring.exists():
+            return scoring
+        return self.data_dir / "resume.md"
 
 
 # Module-level singleton — import this anywhere

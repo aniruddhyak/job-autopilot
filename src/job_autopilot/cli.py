@@ -13,9 +13,10 @@ from job_autopilot import __version__
 from job_autopilot.discover import WorkdaySource
 from job_autopilot.filters import apply_scrape_filter, load_filters
 from job_autopilot.logging_config import configure_logging
-from job_autopilot.models import RawJob, SourcesConfig
+from job_autopilot.models import RawJob, RubricConfig, SourcesConfig
 from job_autopilot.settings import settings
 from job_autopilot.storage import read_json, upsert_models_by_id, write_json
+from job_autopilot.score import build_client, load_resume, score_all_jobs
 
 app = typer.Typer(
     name="job-autopilot",
@@ -290,6 +291,132 @@ def discover(
         for name, count in sorted(by_company.items(), key=lambda kv: -kv[1]):
             typer.echo(f"   {name:20s} {count}")
 
+    
+@app.command()
+def score(
+    force: bool = typer.Option(
+        False, "--force", "-f",
+        help="Re-score every job, ignoring cached results.",
+    ),
+    limit: int = typer.Option(
+        None, "--limit", "-n",
+        help="Only score the first N jobs (for testing).",
+    ),
+    concurrency: int = typer.Option(
+        5, "--concurrency", "-c",
+        help="Max parallel LLM calls (default: 5).",
+    ),
+    model: str = typer.Option(
+        "gpt-4o-mini", "--model",
+        help="OpenAI model to use.",
+    ),
+) -> None:
+    """Score every job in raw_jobs.json against your resume and save to scored_jobs.json."""
+    from dotenv import load_dotenv
+    load_dotenv()
+
+    configure_logging(settings.log_level)
+
+    # Load resume + rubric
+    try:
+        resume = load_resume(settings.resume_file)
+    except Exception as exc:
+        typer.secho(f"❌ Resume error: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from exc
+
+    rubric_path = settings.config_dir / "rubric.json"
+    if rubric_path.exists():
+        rubric = RubricConfig.model_validate(
+            json.loads(rubric_path.read_text(encoding="utf-8"))
+        )
+    else:
+        rubric = RubricConfig.default()
+        typer.secho(
+            "ℹ️  No config/rubric.json found — using default weights.",
+            fg=typer.colors.YELLOW,
+        )
+
+    scored_path = settings.data_dir / "scored_jobs.json"
+
+    typer.secho(
+        f"🤖 Scoring jobs from {settings.raw_jobs_file.name}",
+        fg=typer.colors.CYAN,
+    )
+    typer.secho(
+        f"   Resume:      {resume.path.name} ({resume.estimated_tokens} tokens)",
+        fg=typer.colors.CYAN,
+    )
+    typer.secho(
+        f"   Model:       {model}   |   Concurrency: {concurrency}   |   "
+        f"Force: {force}   |   Limit: {limit or 'all'}",
+        fg=typer.colors.CYAN,
+    )
+    typer.echo("")
+
+    client = build_client()
+
+    summary = asyncio.run(
+        score_all_jobs(
+            raw_jobs_path=settings.raw_jobs_file,
+            scored_jobs_path=scored_path,
+            resume=resume,
+            rubric=rubric,
+            client=client,
+            model=model,
+            concurrency=concurrency,
+            force=force,
+            limit=limit,
+        )
+    )
+
+    # Summary block
+    typer.echo("")
+    typer.secho("═══════════════════════════════════════════", fg=typer.colors.GREEN)
+    typer.secho(f"  Total jobs:    {summary.total}", fg=typer.colors.GREEN)
+    typer.secho(f"  Newly scored:  {summary.scored}", fg=typer.colors.GREEN)
+    typer.secho(f"  Cached (skip): {summary.cached}",
+                fg=typer.colors.YELLOW if summary.cached else typer.colors.GREEN)
+    if summary.failed:
+        typer.secho(f"  Failed:        {summary.failed}", fg=typer.colors.RED)
+    typer.secho(f"  Duration:      {summary.duration_sec}s", fg=typer.colors.GREEN)
+    if summary.scored:
+        cost = summary.estimated_cost(model)
+        typer.secho(f"  Tokens:        {summary.total_tokens:,}",
+                    fg=typer.colors.GREEN)
+        typer.secho(f"  Est. cost:     ${cost:.4f}",
+                    fg=typer.colors.GREEN)
+    typer.secho("═══════════════════════════════════════════", fg=typer.colors.GREEN)
+
+    if summary.errors:
+        typer.echo("")
+        typer.secho(f"⚠ {len(summary.errors)} error(s):", fg=typer.colors.YELLOW)
+        for e in summary.errors[:10]:
+            typer.echo(f"   • {e}")
+
+    # Top 5 preview
+    if scored_path.exists():
+        scored_data = json.loads(scored_path.read_text(encoding="utf-8"))
+        scored_data.sort(key=lambda s: s.get("overall_score", 0), reverse=True)
+        top = scored_data[:5]
+        if top:
+            typer.echo("")
+            typer.secho("🏆 Top matches:", fg=typer.colors.CYAN)
+            for s in top:
+                score_val = s.get("overall_score", 0)
+                rec = s.get("recommendation", "?").upper()
+                # Get title/company by looking up the raw job
+                raw_lookup = {
+                    j["id"]: j
+                    for j in json.loads(
+                        settings.raw_jobs_file.read_text(encoding="utf-8")
+                    )
+                }
+                rj = raw_lookup.get(s["id"], {})
+                title = rj.get("title", "(unknown)")[:50]
+                company = rj.get("company_display", "")
+                typer.echo(
+                    f"   {score_val:3d}  [{rec:8s}]  [{company:12s}] {title}"
+                )
 
 # ----------------------------------------------------------------------
 # Entry point

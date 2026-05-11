@@ -27,10 +27,13 @@ from job_autopilot.storage import (
     upsert_models_by_id,
     write_json,
 )
+from job_autopilot.models import RubricConfig, ScoredJob
+from job_autopilot.score import build_client, load_resume, score_all_jobs
 
 logger = structlog.get_logger(__name__)
 
 FRONTEND_DIR = PROJECT_ROOT / "frontend"
+SCORED_JOBS_FILE = settings.data_dir / "scored_jobs.json"
 
 
 # ----------------------------------------------------------------------
@@ -42,6 +45,12 @@ class CompanyStats(BaseModel):
     name: str
     job_count: int
     last_updated: datetime | None = None
+    top_score: int | None = None
+    top_recommendation: str | None = None
+    apply_count: int = 0
+    consider_count: int = 0
+    skip_count: int = 0
+    scored_count: int = 0
 
 
 class CompaniesResponse(BaseModel):
@@ -60,11 +69,26 @@ class JobItem(BaseModel):
     employment_type: str | None = None
     job_family: str | None = None
     discovered_at: datetime
+    description_text: str | None = None
+    # Scoring (optional — null when not yet scored)
+    score: int | None = None
+    recommendation: str | None = None
+    score_summary: str | None = None
+    strengths: list[str] = Field(default_factory=list)
+    gaps: list[str] = Field(default_factory=list)
+    dimensions: dict[str, int] | None = None
+    scored_at: datetime | None = None
 
 
 class CompanyJobsResponse(BaseModel):
     company: CompanyStats
     jobs: list[JobItem]
+    # Aggregate stats
+    avg_score: float | None = None
+    apply_count: int = 0
+    consider_count: int = 0
+    skip_count: int = 0
+    unscored_count: int = 0
 
 
 class DiscoverResponse(BaseModel):
@@ -76,6 +100,16 @@ class DiscoverResponse(BaseModel):
     duration_sec: float = 0.0
     error: str | None = None
 
+class ScoreResponse(BaseModel):
+    ok: bool
+    total: int = 0
+    scored: int = 0
+    cached: int = 0
+    failed: int = 0
+    tokens_used: int = 0
+    est_cost_usd: float = 0.0
+    duration_sec: float = 0.0
+    error: str | None = None
 
 class HealthResponse(BaseModel):
     status: str = "ok"
@@ -93,6 +127,22 @@ def _load_jobs() -> list[RawJob]:
         return []
     return read_json_list_as(path, RawJob)
 
+def _load_scored_jobs() -> dict[str, ScoredJob]:
+    """Load scored_jobs.json keyed by job id."""
+    if not SCORED_JOBS_FILE.exists():
+        return {}
+    try:
+        raw = json.loads(SCORED_JOBS_FILE.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return {}
+    out: dict[str, ScoredJob] = {}
+    for item in raw:
+        try:
+            sj = ScoredJob.model_validate(item)
+            out[sj.id] = sj
+        except Exception:
+            continue
+    return out
 
 def _load_sources_config() -> SourcesConfig:
     path = settings.sources_file
@@ -126,7 +176,10 @@ def _last_successful_run_time() -> datetime | None:
     return None
 
 
-def _aggregate_companies(jobs: list[RawJob]) -> list[CompanyStats]:
+def _aggregate_companies(
+    jobs: list[RawJob],
+    scores: dict[str, ScoredJob],
+) -> list[CompanyStats]:
     by_company: dict[str, dict[str, Any]] = {}
     for j in jobs:
         slot = by_company.setdefault(
@@ -136,6 +189,12 @@ def _aggregate_companies(jobs: list[RawJob]) -> list[CompanyStats]:
                 "name": j.company_display,
                 "job_count": 0,
                 "last_updated": None,
+                "top_score": None,
+                "top_recommendation": None,
+                "apply_count": 0,
+                "consider_count": 0,
+                "skip_count": 0,
+                "scored_count": 0,
             },
         )
         slot["job_count"] += 1
@@ -143,10 +202,28 @@ def _aggregate_companies(jobs: list[RawJob]) -> list[CompanyStats]:
         if last is None or j.discovered_at > last:
             slot["last_updated"] = j.discovered_at
 
-    return [
-        CompanyStats(**v)
-        for v in sorted(by_company.values(), key=lambda c: -c["job_count"])
-    ]
+        scored = scores.get(j.id)
+        if scored and not scored.error:
+            slot["scored_count"] += 1
+            if (
+                slot["top_score"] is None
+                or scored.overall_score > slot["top_score"]
+            ):
+                slot["top_score"] = scored.overall_score
+                slot["top_recommendation"] = scored.recommendation
+            if scored.recommendation == "apply":
+                slot["apply_count"] += 1
+            elif scored.recommendation == "consider":
+                slot["consider_count"] += 1
+            elif scored.recommendation == "skip":
+                slot["skip_count"] += 1
+
+    companies = [CompanyStats(**v) for v in by_company.values()]
+    # Sort: top_score desc (None last), then job_count desc
+    companies.sort(
+        key=lambda c: (-(c.top_score or -1), -c.job_count),
+    )
+    return companies
 
 
 def _record_run(
@@ -227,7 +304,8 @@ def create_app() -> FastAPI:
     )
     async def list_companies() -> CompaniesResponse:
         jobs = _load_jobs()
-        companies = _aggregate_companies(jobs)
+        scores = _load_scored_jobs()
+        companies = _aggregate_companies(jobs, scores)
         return CompaniesResponse(
             total_jobs=len(jobs),
             company_count=len(companies),
@@ -243,6 +321,7 @@ def create_app() -> FastAPI:
     async def jobs_for_company(company_id: str) -> CompanyJobsResponse:
         company_id = company_id.lower()
         all_jobs = _load_jobs()
+        scores = _load_scored_jobs()
         company_jobs = [j for j in all_jobs if j.company == company_id]
 
         if not company_jobs:
@@ -254,24 +333,83 @@ def create_app() -> FastAPI:
         company_name = company_jobs[0].company_display
         last_updated = max(j.discovered_at for j in company_jobs)
 
-        company_jobs.sort(
-            key=lambda j: (j.posted_on or "", j.discovered_at.isoformat()),
-            reverse=True,
-        )
+        items: list[JobItem] = []
+        apply_count = consider_count = skip_count = unscored_count = 0
+        score_sum = 0
+        scored_count = 0
+        top_score: int | None = None
+        top_rec: str | None = None
 
-        items = [
-            JobItem(
-                id=j.id,
-                title=j.title,
-                location=j.location,
-                posted_on=j.posted_on,
-                url=str(j.url),
-                employment_type=j.employment_type,
-                job_family=j.job_family,
-                discovered_at=j.discovered_at,
+        for j in company_jobs:
+            s = scores.get(j.id)
+            score_val = None
+            rec = None
+            summary_text = None
+            strengths: list[str] = []
+            gaps: list[str] = []
+            dims_dict: dict[str, int] | None = None
+            scored_at = None
+
+            if s and not s.error:
+                score_val = s.overall_score
+                rec = s.recommendation
+                summary_text = s.summary
+                strengths = list(s.strengths)
+                gaps = list(s.gaps)
+                dims_dict = {
+                    "skills_match": s.dimensions.skills_match,
+                    "experience_level": s.dimensions.experience_level,
+                    "domain_match": s.dimensions.domain_match,
+                    "role_fit": s.dimensions.role_fit,
+                }
+                scored_at = s.scored_at
+                score_sum += score_val
+                scored_count += 1
+                if top_score is None or score_val > top_score:
+                    top_score = score_val
+                    top_rec = rec
+                if rec == "apply":
+                    apply_count += 1
+                elif rec == "consider":
+                    consider_count += 1
+                elif rec == "skip":
+                    skip_count += 1
+            else:
+                unscored_count += 1
+
+            items.append(
+                JobItem(
+                    id=j.id,
+                    title=j.title,
+                    location=j.location,
+                    posted_on=j.posted_on,
+                    url=str(j.url),
+                    employment_type=j.employment_type,
+                    job_family=j.job_family,
+                    discovered_at=j.discovered_at,
+                    description_text=j.description_text,
+                    score=score_val,
+                    recommendation=rec,
+                    score_summary=summary_text,
+                    strengths=strengths,
+                    gaps=gaps,
+                    dimensions=dims_dict,
+                    scored_at=scored_at,
+                )
             )
-            for j in company_jobs
-        ]
+
+        # Sort: scored desc by score, then unscored at the end by posted_on
+        def _sort_key(item: JobItem) -> tuple[int, int, str]:
+            has_score = item.score is not None
+            return (
+                0 if has_score else 1,
+                -(item.score or 0),
+                item.discovered_at.isoformat(),
+            )
+
+        items.sort(key=_sort_key)
+
+        avg_score = round(score_sum / scored_count, 1) if scored_count else None
 
         return CompanyJobsResponse(
             company=CompanyStats(
@@ -279,8 +417,19 @@ def create_app() -> FastAPI:
                 name=company_name,
                 job_count=len(company_jobs),
                 last_updated=last_updated,
+                top_score=top_score,
+                top_recommendation=top_rec,
+                apply_count=apply_count,
+                consider_count=consider_count,
+                skip_count=skip_count,
+                scored_count=scored_count,
             ),
             jobs=items,
+            avg_score=avg_score,
+            apply_count=apply_count,
+            consider_count=consider_count,
+            skip_count=skip_count,
+            unscored_count=unscored_count,
         )
 
     # ---------------- Discover (with filtering) ----------------
@@ -357,6 +506,61 @@ def create_app() -> FastAPI:
             added=added,
             updated=updated,
             duration_sec=round(duration, 2),
+        )
+
+    @app.post("/api/score", response_model=ScoreResponse, tags=["actions"])
+    async def trigger_score(
+        force: bool = False,
+        concurrency: int = 5,
+    ) -> ScoreResponse:
+        from dotenv import load_dotenv
+        load_dotenv()
+
+        # Load resume
+        try:
+            resume = load_resume(settings.resume_file)
+        except Exception as exc:
+            return ScoreResponse(ok=False, error=f"Resume error: {exc}")
+
+        # Load rubric
+        rubric_path = settings.config_dir / "rubric.json"
+        if rubric_path.exists():
+            rubric = RubricConfig.model_validate(
+                json.loads(rubric_path.read_text(encoding="utf-8"))
+            )
+        else:
+            rubric = RubricConfig.default()
+
+        # Build client
+        try:
+            client = build_client()
+        except Exception as exc:
+            return ScoreResponse(ok=False, error=str(exc))
+
+        # Run
+        try:
+            summary = await score_all_jobs(
+                raw_jobs_path=settings.raw_jobs_file,
+                scored_jobs_path=SCORED_JOBS_FILE,
+                resume=resume,
+                rubric=rubric,
+                client=client,
+                concurrency=concurrency,
+                force=force,
+            )
+        except Exception as exc:  # pragma: no cover
+            logger.error("api_score_failed", error=str(exc))
+            return ScoreResponse(ok=False, error=str(exc))
+
+        return ScoreResponse(
+            ok=True,
+            total=summary.total,
+            scored=summary.scored,
+            cached=summary.cached,
+            failed=summary.failed,
+            tokens_used=summary.total_tokens,
+            est_cost_usd=round(summary.estimated_cost("gpt-4o-mini"), 4),
+            duration_sec=summary.duration_sec,
         )
 
     # ---------------- Static frontend ----------------

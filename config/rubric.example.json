@@ -1,0 +1,18 @@
+{
+  "__comment": "Sample rubric configuration. Copy to rubric.json and edit to bias the LLM scoring toward what matters to you. All four weights should sum to ~1.0 (but the code will normalize if they don't).",
+
+  "skills_weight": 0.35,
+  "experience_weight": 0.25,
+  "domain_weight": 0.20,
+  "role_fit_weight": 0.20,
+
+  "focus_areas": "Describe what matters most to you. Example: 'I have 10 years in .NET and Python. Looking for senior engineering roles in fintech or AI/ML. Prefer hands-on coding over pure management.'",
+
+  "__schema_help": {
+    "skills_weight": "How much tech stack match matters (0.0 - 1.0).",
+    "experience_weight": "How much seniority fit matters.",
+    "domain_weight": "How much industry / product area familiarity matters.",
+    "role_fit_weight": "How much hands-on-coding-vs-management balance matters.",
+    "focus_areas": "Free text appended to the LLM prompt to bias scoring toward what you care about."
+  }
+}

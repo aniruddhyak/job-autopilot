@@ -16,13 +16,14 @@
 data/*.json
 data/cover_letters/
 data/resume.md
+data/resume_scoring.md
 data/resume.pdf
 data/resume.docx
 
 # Personal config — keep real preferences out of the public repo
-# (Examples at config/*.example.json are tracked and document the schema)
 config/sources.json
 config/filters.json
+config/rubric.json
 
 # But keep the folder structure visible in the repo
 !data/.gitkeep
