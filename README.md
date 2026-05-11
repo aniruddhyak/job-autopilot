@@ -44,7 +44,7 @@ resume using LLMs, and tracks your applications — all from a local dashboard.
 
 ```bash
 # Clone
-git clone https://github.com/<your-username>/job-autopilot.git
+git clone https://github.com/aniruddhyak/job-autopilot.git
 cd job-autopilot
 
 # Create + activate virtual environment
