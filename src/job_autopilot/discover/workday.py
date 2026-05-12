@@ -190,6 +190,105 @@ class WorkdaySource(DiscoverySource):
         return enriched
 
     # ------------------------------------------------------------------
+    # Resolve placeholder ('N Locations') jobs via detail endpoint
+    # ------------------------------------------------------------------
+
+    async def resolve_pending_locations(
+        self,
+        jobs: RawJobList,
+        *,
+        concurrency: int = 5,
+    ) -> RawJobList:
+        """For each job, fetch the detail endpoint and update its location
+        field with the real cities from the response. Concurrent + bounded.
+
+        Jobs whose detail call fails are returned with their original
+        (placeholder) location unchanged.
+        """
+        if not jobs:
+            return []
+
+        org_by_slug = {o.company: o for o in self.orgs}
+        sem = asyncio.Semaphore(concurrency)
+
+        async with self._build_client() as client:
+            async def _resolve_one(j: RawJob) -> RawJob:
+                async with sem:
+                    org = org_by_slug.get(j.company)
+                    if not org:
+                        return j
+                    external_path = self._extract_external_path(str(j.url), org)
+                    if not external_path:
+                        return j
+
+                    details = await self._get_json_with_retry(
+                        client,
+                        self._detail_url(org, external_path),
+                        self.log.bind(company=org.company, job_id=j.id),
+                    )
+                    if not details:
+                        return j
+
+                    real_loc = self._extract_real_locations(details)
+                    if real_loc:
+                        return j.model_copy(update={"location": real_loc})
+                    return j
+
+            results = await asyncio.gather(*(_resolve_one(j) for j in jobs))
+        return list(results)
+
+    @staticmethod
+    def _extract_real_locations(details: dict[str, Any]) -> str | None:
+        """Pull real location text from a Workday detail response.
+
+        Different tenants put it in different fields, so we try several
+        and join them.
+        """
+        info = details.get("jobPostingInfo") or {}
+        parts: list[str] = []
+
+        primary = info.get("location")
+        if isinstance(primary, str) and primary.strip():
+            parts.append(primary.strip())
+
+        additional = info.get("additionalLocations")
+        if isinstance(additional, str):
+            parts.append(additional.strip())
+        elif isinstance(additional, list):
+            for loc in additional:
+                if isinstance(loc, str):
+                    parts.append(loc.strip())
+                elif isinstance(loc, dict):
+                    name = loc.get("name") or loc.get("locationName")
+                    if name:
+                        parts.append(str(name).strip())
+
+        job_locs = info.get("jobLocations") or info.get("locations")
+        if isinstance(job_locs, list):
+            for loc in job_locs:
+                if isinstance(loc, str):
+                    parts.append(loc.strip())
+                elif isinstance(loc, dict):
+                    name = loc.get("name") or loc.get("locationName")
+                    if name:
+                        parts.append(str(name).strip())
+
+        loc_text = info.get("locationsText")
+        if isinstance(loc_text, str) and loc_text.strip():
+            parts.append(loc_text.strip())
+
+        # Dedup while preserving order
+        seen: set[str] = set()
+        deduped: list[str] = []
+        for p in parts:
+            if p and p not in seen:
+                seen.add(p)
+                deduped.append(p)
+        if not deduped:
+            return None
+        return "; ".join(deduped)
+
+    # ------------------------------------------------------------------
     # Per-org scrape
     # ------------------------------------------------------------------
 

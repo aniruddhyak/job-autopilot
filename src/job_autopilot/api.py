@@ -17,7 +17,12 @@ from pydantic import BaseModel, Field
 
 from job_autopilot import __version__
 from job_autopilot.discover import WorkdaySource
-from job_autopilot.filters import apply_scrape_filter, load_filters
+from job_autopilot.filters import (
+    apply_location_filter_to_resolved,
+    apply_scrape_filter,
+    finalize_filter_report,
+    load_filters,
+)
 from job_autopilot.logging_config import configure_logging
 from job_autopilot.models import RawJob, SourcesConfig
 from job_autopilot.settings import PROJECT_ROOT, settings
@@ -235,22 +240,24 @@ def _record_run(
     duration_sec: float,
     ok: bool,
     error: str | None = None,
+    filter_report: dict | None = None,
 ) -> None:
     runs = read_json(settings.runs_file, default=[])
     if not isinstance(runs, list):
         runs = []
-    runs.append(
-        {
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "sources": sources,
-            "discovered": discovered,
-            "added": added,
-            "updated": updated,
-            "duration_sec": round(duration_sec, 2),
-            "ok": ok,
-            "error": error,
-        }
-    )
+    entry: dict = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "sources": sources,
+        "discovered": discovered,
+        "added": added,
+        "updated": updated,
+        "duration_sec": round(duration_sec, 2),
+        "ok": ok,
+        "error": error,
+    }
+    if filter_report is not None:
+        entry["filter_report"] = filter_report
+    runs.append(entry)
     write_json(settings.runs_file, runs)
 
 
@@ -468,12 +475,26 @@ def create_app() -> FastAPI:
                 error=str(exc),
             )
 
-        # Apply the same filters as the CLI
-        # Apply the same filters as the CLI
+        # Apply the same two-pass filters as the CLI
         filters_config = load_filters(settings.config_dir)
-        kept_jobs, _stats = apply_scrape_filter(jobs, filters_config)
+        kept_jobs, pending_jobs, report_state = apply_scrape_filter(
+            jobs, filters_config
+        )
 
-        # Enrich filtered jobs with JD details (best effort)
+        # Pass 2: resolve placeholder locations
+        if pending_jobs:
+            try:
+                resolved = await source.resolve_pending_locations(pending_jobs)
+                extra_kept = apply_location_filter_to_resolved(
+                    resolved, report_state
+                )
+                kept_jobs = kept_jobs + extra_kept
+            except Exception as exc:
+                logger.warning("api_location_resolve_failed", error=str(exc))
+
+        filter_stats = finalize_filter_report(report_state)
+
+        # Enrich kept jobs with JD details (best effort)
         if kept_jobs:
             try:
                 kept_jobs = await source.enrich_details(kept_jobs)
@@ -497,6 +518,7 @@ def create_app() -> FastAPI:
             updated=updated,
             duration_sec=duration,
             ok=True,
+            filter_report=filter_stats,
         )
 
         return DiscoverResponse(

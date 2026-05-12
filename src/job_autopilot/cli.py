@@ -11,12 +11,17 @@ import typer
 
 from job_autopilot import __version__
 from job_autopilot.discover import WorkdaySource
-from job_autopilot.filters import apply_scrape_filter, load_filters
+from job_autopilot.filters import (
+    apply_location_filter_to_resolved,
+    apply_scrape_filter,
+    finalize_filter_report,
+    load_filters,
+)
 from job_autopilot.logging_config import configure_logging
 from job_autopilot.models import RawJob, RubricConfig, SourcesConfig
+from job_autopilot.score import build_client, load_resume, score_all_jobs
 from job_autopilot.settings import settings
 from job_autopilot.storage import read_json, upsert_models_by_id, write_json
-from job_autopilot.score import build_client, load_resume, score_all_jobs
 
 app = typer.Typer(
     name="job-autopilot",
@@ -35,11 +40,18 @@ logger = structlog.get_logger(__name__)
 def _load_sources_config() -> SourcesConfig:
     path = settings.sources_file
     if not path.exists():
+        example = path.with_name("sources.example.json")
         typer.secho(
             f"❌ sources.json not found at {path}",
             fg=typer.colors.RED,
             err=True,
         )
+        if example.exists():
+            typer.secho(
+                f"💡 Copy the example to get started:\n"
+                f"   Copy-Item {example} {path}",
+                fg=typer.colors.YELLOW,
+            )
         raise typer.Exit(code=1)
     raw = json.loads(path.read_text(encoding="utf-8"))
     return SourcesConfig.model_validate(raw)
@@ -54,24 +66,42 @@ def _record_run(
     duration_sec: float,
     ok: bool,
     error: str | None = None,
+    filter_report: dict | None = None,
 ) -> None:
     """Append a run summary entry to data/runs.json."""
     runs = read_json(settings.runs_file, default=[])
     if not isinstance(runs, list):
         runs = []
-    runs.append(
-        {
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "sources": sources,
-            "discovered": discovered,
-            "added": added,
-            "updated": updated,
-            "duration_sec": round(duration_sec, 2),
-            "ok": ok,
-            "error": error,
-        }
-    )
+    entry: dict = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "sources": sources,
+        "discovered": discovered,
+        "added": added,
+        "updated": updated,
+        "duration_sec": round(duration_sec, 2),
+        "ok": ok,
+        "error": error,
+    }
+    if filter_report is not None:
+        entry["filter_report"] = filter_report
+    runs.append(entry)
     write_json(settings.runs_file, runs)
+
+
+def _print_top(
+    counts: dict,
+    title: str,
+    *,
+    limit: int = 10,
+    indent: str = "  ",
+) -> None:
+    """Pretty-print a count dict (already sorted desc)."""
+    if not counts:
+        return
+    typer.echo("")
+    typer.secho(f"{title}:", fg=typer.colors.YELLOW)
+    for k, v in list(counts.items())[:limit]:
+        typer.echo(f"{indent}{v:5d}  {k}")
 
 
 # ----------------------------------------------------------------------
@@ -91,9 +121,8 @@ def status() -> None:
     if raw.exists():
         try:
             data = json.loads(raw.read_text(encoding="utf-8"))
-            print_total = f"  Jobs in raw_jobs.json: {len(data)}"
+            typer.echo(f"  Jobs in raw_jobs.json: {len(data)}")
             with_jd = sum(1 for j in data if j.get("description"))
-            typer.echo(print_total)
             typer.echo(f"  With JD:               {with_jd}")
         except Exception:
             typer.echo("  raw_jobs.json: present but unreadable")
@@ -158,7 +187,7 @@ def discover(
     source = WorkdaySource(
         orgs=workday_orgs,
         max_jobs_per_org=max_per_org,
-        fetch_details=False,           # we'll enrich manually after filtering
+        fetch_details=False,
         polite_delay=polite_delay,
     )
 
@@ -186,33 +215,67 @@ def discover(
         fg=typer.colors.GREEN,
     )
 
-    # -------- 2. Apply filters --------
+    # -------- 2. Apply filters (two-pass: title+age, then location with resolve) --------
+    filter_report: dict | None = None
+
     if no_filter:
         kept_jobs = jobs
         typer.secho("⚙  Filters bypassed (--no-filter)", fg=typer.colors.YELLOW)
     else:
         filters_config = load_filters(settings.config_dir)
         override_locations = list(location) if location else None
-        kept_jobs, stats = apply_scrape_filter(
+
+        kept_jobs, pending_jobs, report_state = apply_scrape_filter(
             jobs,
             filters_config,
             override_location_ids=override_locations,
             override_max_age_days=max_age,
         )
-        if stats["filters_off"]:
+        overall = report_state["_overall"]
+
+        if overall.get("filters_off"):
             typer.secho(
                 "⚙  Filters disabled in config (scrape_filter.enabled=false)",
                 fg=typer.colors.YELLOW,
             )
         else:
             typer.secho(
-                f"🔎 Filtered: kept {stats['kept']}/{stats['input']} "
-                f"(loc:{stats['dropped_loc']} title:{stats['dropped_title']} "
-                f"age:{stats['dropped_age']})",
+                f"🔎 Pass 1: kept {overall['kept']}/{overall['input']} "
+                f"(title:{overall['dropped_title']} "
+                f"age:{overall['dropped_age']} "
+                f"loc:{overall['dropped_loc']} "
+                f"pending:{overall['pending_loc']})",
                 fg=typer.colors.CYAN,
             )
 
-    # -------- 3. Enrich with JD (default: yes) --------
+        # Pass 2: resolve real locations for placeholder jobs
+        if pending_jobs:
+            typer.secho(
+                f"🔍 Resolving real locations for "
+                f"{len(pending_jobs)} multi-city posting(s)...",
+                fg=typer.colors.CYAN,
+            )
+            resolve_started = datetime.now(timezone.utc)
+            try:
+                resolved = asyncio.run(source.resolve_pending_locations(pending_jobs))
+                extra_kept = apply_location_filter_to_resolved(resolved, report_state)
+                kept_jobs = kept_jobs + extra_kept
+                rdur = (datetime.now(timezone.utc) - resolve_started).total_seconds()
+                typer.secho(
+                    f"✓ Recovered {len(extra_kept)}/{len(pending_jobs)} "
+                    f"in {rdur:.1f}s.",
+                    fg=typer.colors.GREEN,
+                )
+            except Exception as exc:
+                logger.warning("location_resolve_failed", error=str(exc))
+                typer.secho(
+                    f"⚠ Location resolve failed: {exc} — pending jobs dropped",
+                    fg=typer.colors.YELLOW,
+                )
+
+        filter_report = finalize_filter_report(report_state)
+
+    # -------- 3. Enrich with JD --------
     if list_only:
         typer.secho("📄 Skipping JD enrichment (--list-only)", fg=typer.colors.YELLOW)
         enriched_jobs = kept_jobs
@@ -258,6 +321,7 @@ def discover(
             updated=0,
             duration_sec=duration,
             ok=True,
+            filter_report=filter_report,
         )
         return
 
@@ -281,6 +345,7 @@ def discover(
         updated=updated,
         duration_sec=duration,
         ok=True,
+        filter_report=filter_report,
     )
 
     by_company: dict[str, int] = {}
@@ -291,7 +356,7 @@ def discover(
         for name, count in sorted(by_company.items(), key=lambda kv: -kv[1]):
             typer.echo(f"   {name:20s} {count}")
 
-    
+
 @app.command()
 def score(
     force: bool = typer.Option(
@@ -317,7 +382,6 @@ def score(
 
     configure_logging(settings.log_level)
 
-    # Load resume + rubric
     try:
         resume = load_resume(settings.resume_file)
     except Exception as exc:
@@ -369,7 +433,6 @@ def score(
         )
     )
 
-    # Summary block
     typer.echo("")
     typer.secho("═══════════════════════════════════════════", fg=typer.colors.GREEN)
     typer.secho(f"  Total jobs:    {summary.total}", fg=typer.colors.GREEN)
@@ -393,7 +456,6 @@ def score(
         for e in summary.errors[:10]:
             typer.echo(f"   • {e}")
 
-    # Top 5 preview
     if scored_path.exists():
         scored_data = json.loads(scored_path.read_text(encoding="utf-8"))
         scored_data.sort(key=lambda s: s.get("overall_score", 0), reverse=True)
@@ -401,22 +463,101 @@ def score(
         if top:
             typer.echo("")
             typer.secho("🏆 Top matches:", fg=typer.colors.CYAN)
+            raw_lookup = {
+                j["id"]: j
+                for j in json.loads(
+                    settings.raw_jobs_file.read_text(encoding="utf-8")
+                )
+            }
             for s in top:
                 score_val = s.get("overall_score", 0)
                 rec = s.get("recommendation", "?").upper()
-                # Get title/company by looking up the raw job
-                raw_lookup = {
-                    j["id"]: j
-                    for j in json.loads(
-                        settings.raw_jobs_file.read_text(encoding="utf-8")
-                    )
-                }
                 rj = raw_lookup.get(s["id"], {})
                 title = rj.get("title", "(unknown)")[:50]
                 company = rj.get("company_display", "")
                 typer.echo(
                     f"   {score_val:3d}  [{rec:8s}]  [{company:12s}] {title}"
                 )
+
+
+@app.command()
+def stats(
+    last: int = typer.Option(
+        1, "--last", "-n",
+        help="Show the last N runs (default: 1).",
+    ),
+) -> None:
+    """Show discovery + filter statistics from past runs."""
+    history = read_json(settings.runs_file, default=[])
+    if not isinstance(history, list) or not history:
+        typer.echo("No runs recorded yet.")
+        return
+
+    last_n = history[-last:][::-1]
+
+    for i, entry in enumerate(last_n):
+        idx = len(history) - i
+        typer.secho(
+            f"\nRun #{idx}  ({entry.get('timestamp', '?')})",
+            fg=typer.colors.CYAN, bold=True,
+        )
+        typer.echo("─" * 60)
+        typer.echo(f"  Discovered:  {entry.get('discovered', 0)}")
+        typer.echo(f"  Added:       {entry.get('added', 0)}")
+        typer.echo(f"  Updated:     {entry.get('updated', 0)}")
+        typer.echo(f"  Duration:    {entry.get('duration_sec', 0)}s")
+        typer.echo(f"  Status:      {'OK' if entry.get('ok') else 'FAILED'}")
+        if entry.get("error"):
+            typer.echo(f"  Error:       {entry['error']}")
+
+        report = entry.get("filter_report")
+        if not report:
+            typer.echo("  (No filter detail recorded for this run)")
+            continue
+
+        typer.echo("")
+        typer.secho("Overall:", fg=typer.colors.YELLOW)
+        typer.echo(f"  Input:                  {report.get('input', 0)}")
+        typer.echo(f"  Kept:                   {report.get('kept', 0)}")
+        typer.echo(f"  Dropped by location:    {report.get('dropped_loc', 0)}")
+        typer.echo(f"  Dropped by title:       {report.get('dropped_title', 0)}")
+        typer.echo(f"  Dropped by age:         {report.get('dropped_age', 0)}")
+
+        _print_top(report.get("dropped_by_location", {}),
+                   "Top dropped locations", limit=10)
+        _print_top(report.get("dropped_by_title_keyword", {}),
+                   "Top dropped title keywords", limit=10)
+        _print_top(report.get("dropped_by_age_bucket", {}),
+                   "Dropped by age bucket", limit=10)
+
+        per_co = report.get("per_company", {})
+        if per_co:
+            typer.echo("")
+            typer.secho("Per-company breakdown:", fg=typer.colors.YELLOW)
+            sorted_co = sorted(
+                per_co.items(), key=lambda x: -x[1].get("input", 0)
+            )
+            for company, cs in sorted_co:
+                typer.echo("")
+                typer.secho(f"  {company}", bold=True)
+                typer.echo(
+                    f"    Input: {cs.get('input', 0)}    "
+                    f"Kept: {cs.get('kept', 0)}    "
+                    f"Loc: {cs.get('dropped_loc', 0)}    "
+                    f"Title: {cs.get('dropped_title', 0)}    "
+                    f"Age: {cs.get('dropped_age', 0)}"
+                )
+                _print_top(
+                    cs.get("dropped_by_location", {}),
+                    "    Top locations dropped",
+                    limit=5, indent="      ",
+                )
+                _print_top(
+                    cs.get("dropped_by_title_keyword", {}),
+                    "    Top title keywords dropped",
+                    limit=5, indent="      ",
+                )
+
 
 # ----------------------------------------------------------------------
 # Entry point

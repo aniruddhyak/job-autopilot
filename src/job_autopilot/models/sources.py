@@ -30,12 +30,19 @@ class _OrgBase(BaseModel):
 class WorkdayOrg(_OrgBase):
     """A Workday tenant configured for discovery.
 
-    URL pattern:
+    Standard URL pattern:
         https://{company}.wd{num}.myworkdayjobs.com/wday/cxs/{company}/{site}/jobs
+
+    Some tenants are hosted on the alternate myworkdaysite.com (e.g. Wells Fargo).
+    Tenant numbers can exceed 99 (e.g. Netflix uses wd108).
     """
 
     site: str = Field(..., description="Workday careers site name, e.g. 'Cisco_Careers'.")
-    num: int = Field(..., ge=1, le=99, description="Workday subdomain number (wd1..wd99).")
+    num: int = Field(..., ge=1, le=999, description="Workday subdomain number (wd1..wd999).")
+    host: str = Field(
+        "myworkdayjobs.com",
+        description="Hostname suffix. Defaults to 'myworkdayjobs.com'.",
+    )
 
 
 class GreenhouseOrg(_OrgBase):
