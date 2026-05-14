@@ -230,5 +230,5 @@ For jobs marked **Did Not Apply / Do Not Apply**, the dashboard should support a
 ---
 
 ## 📄 License
-
-Personal project. License TBD.
+This project is licensed under the MIT License.
+See the LICENSE file for details.
