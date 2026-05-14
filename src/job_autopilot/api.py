@@ -1,4 +1,4 @@
-"""FastAPI application — read-only dashboard backend."""
+"""FastAPI application — read-only dashboard backend + application tracking."""
 
 from __future__ import annotations
 
@@ -24,21 +24,32 @@ from job_autopilot.filters import (
     load_filters,
 )
 from job_autopilot.logging_config import configure_logging
-from job_autopilot.models import RawJob, SourcesConfig
+from job_autopilot.models import (
+    Application,
+    ApplicationStatus,
+    RawJob,
+    RubricConfig,
+    ScoredJob,
+    SourcesConfig,
+)
+from job_autopilot.score import build_client, load_resume, score_all_jobs
 from job_autopilot.settings import PROJECT_ROOT, settings
 from job_autopilot.storage import (
+    compute_status_stats,
+    delete_application,
+    load_applications,
     read_json,
     read_json_list_as,
+    save_application,
     upsert_models_by_id,
     write_json,
 )
-from job_autopilot.models import RubricConfig, ScoredJob
-from job_autopilot.score import build_client, load_resume, score_all_jobs
 
 logger = structlog.get_logger(__name__)
 
 FRONTEND_DIR = PROJECT_ROOT / "frontend"
 SCORED_JOBS_FILE = settings.data_dir / "scored_jobs.json"
+APPLICATIONS_FILE = settings.applications_file
 
 
 # ----------------------------------------------------------------------
@@ -56,6 +67,11 @@ class CompanyStats(BaseModel):
     consider_count: int = 0
     skip_count: int = 0
     scored_count: int = 0
+    interested_count: int = 0
+    applied_count: int = 0
+    interview_count: int = 0
+    offer_count: int = 0
+    rejected_count: int = 0
 
 
 class CompaniesResponse(BaseModel):
@@ -75,7 +91,6 @@ class JobItem(BaseModel):
     job_family: str | None = None
     discovered_at: datetime
     description_text: str | None = None
-    # Scoring (optional — null when not yet scored)
     score: int | None = None
     recommendation: str | None = None
     score_summary: str | None = None
@@ -83,12 +98,12 @@ class JobItem(BaseModel):
     gaps: list[str] = Field(default_factory=list)
     dimensions: dict[str, int] | None = None
     scored_at: datetime | None = None
+    application: Application | None = None
 
 
 class CompanyJobsResponse(BaseModel):
     company: CompanyStats
     jobs: list[JobItem]
-    # Aggregate stats
     avg_score: float | None = None
     apply_count: int = 0
     consider_count: int = 0
@@ -105,6 +120,7 @@ class DiscoverResponse(BaseModel):
     duration_sec: float = 0.0
     error: str | None = None
 
+
 class ScoreResponse(BaseModel):
     ok: bool
     total: int = 0
@@ -116,9 +132,26 @@ class ScoreResponse(BaseModel):
     duration_sec: float = 0.0
     error: str | None = None
 
+
 class HealthResponse(BaseModel):
     status: str = "ok"
     version: str = Field(default_factory=lambda: __version__)
+
+
+class ApplicationUpdateRequest(BaseModel):
+    status: ApplicationStatus
+    note: str = Field("", description="Note attached to this transition.")
+    notes: str | None = Field(None, description="Replace running notes.")
+    applied_at: datetime | None = Field(None, description="Optional override.")
+
+
+class ApplicationStatsResponse(BaseModel):
+    interested: int = 0
+    applied: int = 0
+    interview: int = 0
+    offer: int = 0
+    rejected: int = 0
+    total: int = 0
 
 
 # ----------------------------------------------------------------------
@@ -126,14 +159,13 @@ class HealthResponse(BaseModel):
 # ----------------------------------------------------------------------
 
 def _load_jobs() -> list[RawJob]:
-    """Load raw_jobs.json, returning [] if missing."""
     path = settings.raw_jobs_file
     if not path.exists():
         return []
     return read_json_list_as(path, RawJob)
 
+
 def _load_scored_jobs() -> dict[str, ScoredJob]:
-    """Load scored_jobs.json keyed by job id."""
     if not SCORED_JOBS_FILE.exists():
         return {}
     try:
@@ -149,6 +181,7 @@ def _load_scored_jobs() -> dict[str, ScoredJob]:
             continue
     return out
 
+
 def _load_sources_config() -> SourcesConfig:
     path = settings.sources_file
     if not path.exists():
@@ -161,7 +194,6 @@ def _load_sources_config() -> SourcesConfig:
 
 
 def _load_filters_config() -> dict[str, Any]:
-    """Load config/filters.json. Returns empty dict if missing."""
     path = settings.config_dir / "filters.json"
     if not path.exists():
         return {"locations": []}
@@ -184,6 +216,7 @@ def _last_successful_run_time() -> datetime | None:
 def _aggregate_companies(
     jobs: list[RawJob],
     scores: dict[str, ScoredJob],
+    apps: dict[str, Application],
 ) -> list[CompanyStats]:
     by_company: dict[str, dict[str, Any]] = {}
     for j in jobs:
@@ -200,6 +233,11 @@ def _aggregate_companies(
                 "consider_count": 0,
                 "skip_count": 0,
                 "scored_count": 0,
+                "interested_count": 0,
+                "applied_count": 0,
+                "interview_count": 0,
+                "offer_count": 0,
+                "rejected_count": 0,
             },
         )
         slot["job_count"] += 1
@@ -223,11 +261,24 @@ def _aggregate_companies(
             elif scored.recommendation == "skip":
                 slot["skip_count"] += 1
 
+        app = apps.get(j.id)
+        if app:
+            status = app.status
+            if status == "interested":
+                slot["interested_count"] += 1
+            elif status == "applied":
+                slot["applied_count"] += 1
+            elif status == "interview":
+                slot["interview_count"] += 1
+                slot["applied_count"] += 1
+            elif status == "offer":
+                slot["offer_count"] += 1
+                slot["applied_count"] += 1
+            elif status == "rejected":
+                slot["rejected_count"] += 1
+
     companies = [CompanyStats(**v) for v in by_company.values()]
-    # Sort: top_score desc (None last), then job_count desc
-    companies.sort(
-        key=lambda c: (-(c.top_score or -1), -c.job_count),
-    )
+    companies.sort(key=lambda c: (-(c.top_score or -1), -c.job_count))
     return companies
 
 
@@ -291,18 +342,13 @@ def create_app() -> FastAPI:
         allow_headers=["*"],
     )
 
-    # ---------------- Health ----------------
-
     @app.get("/api/health", response_model=HealthResponse, tags=["meta"])
     async def health() -> HealthResponse:
         return HealthResponse()
 
     @app.get("/api/filters", tags=["meta"])
     async def get_filters() -> dict[str, Any]:
-        """Return location filters defined in config/filters.json."""
         return _load_filters_config()
-
-    # ---------------- Companies ----------------
 
     @app.get(
         "/api/companies",
@@ -312,7 +358,8 @@ def create_app() -> FastAPI:
     async def list_companies() -> CompaniesResponse:
         jobs = _load_jobs()
         scores = _load_scored_jobs()
-        companies = _aggregate_companies(jobs, scores)
+        apps = load_applications(APPLICATIONS_FILE)
+        companies = _aggregate_companies(jobs, scores, apps)
         return CompaniesResponse(
             total_jobs=len(jobs),
             company_count=len(companies),
@@ -329,6 +376,7 @@ def create_app() -> FastAPI:
         company_id = company_id.lower()
         all_jobs = _load_jobs()
         scores = _load_scored_jobs()
+        apps = load_applications(APPLICATIONS_FILE)
         company_jobs = [j for j in all_jobs if j.company == company_id]
 
         if not company_jobs:
@@ -346,6 +394,12 @@ def create_app() -> FastAPI:
         scored_count = 0
         top_score: int | None = None
         top_rec: str | None = None
+
+        interested_count = 0
+        applied_count = 0
+        interview_count = 0
+        offer_count = 0
+        rejected_count = 0
 
         for j in company_jobs:
             s = scores.get(j.id)
@@ -384,6 +438,21 @@ def create_app() -> FastAPI:
             else:
                 unscored_count += 1
 
+            app_record = apps.get(j.id)
+            if app_record:
+                if app_record.status == "interested":
+                    interested_count += 1
+                elif app_record.status == "applied":
+                    applied_count += 1
+                elif app_record.status == "interview":
+                    interview_count += 1
+                    applied_count += 1
+                elif app_record.status == "offer":
+                    offer_count += 1
+                    applied_count += 1
+                elif app_record.status == "rejected":
+                    rejected_count += 1
+
             items.append(
                 JobItem(
                     id=j.id,
@@ -402,10 +471,10 @@ def create_app() -> FastAPI:
                     gaps=gaps,
                     dimensions=dims_dict,
                     scored_at=scored_at,
+                    application=app_record,
                 )
             )
 
-        # Sort: scored desc by score, then unscored at the end by posted_on
         def _sort_key(item: JobItem) -> tuple[int, int, str]:
             has_score = item.score is not None
             return (
@@ -430,6 +499,11 @@ def create_app() -> FastAPI:
                 consider_count=consider_count,
                 skip_count=skip_count,
                 scored_count=scored_count,
+                interested_count=interested_count,
+                applied_count=applied_count,
+                interview_count=interview_count,
+                offer_count=offer_count,
+                rejected_count=rejected_count,
             ),
             jobs=items,
             avg_score=avg_score,
@@ -438,8 +512,6 @@ def create_app() -> FastAPI:
             skip_count=skip_count,
             unscored_count=unscored_count,
         )
-
-    # ---------------- Discover (with filtering) ----------------
 
     @app.post("/api/discover", response_model=DiscoverResponse, tags=["actions"])
     async def trigger_discover() -> DiscoverResponse:
@@ -457,34 +529,25 @@ def create_app() -> FastAPI:
 
         try:
             jobs = await source.discover()
-        except Exception as exc:  # pragma: no cover
+        except Exception as exc:
             duration = (datetime.now(timezone.utc) - started).total_seconds()
             logger.error("api_discover_failed", error=str(exc))
             _record_run(
-                sources=["workday"],
-                discovered=0,
-                added=0,
-                updated=0,
-                duration_sec=duration,
-                ok=False,
-                error=str(exc),
+                sources=["workday"], discovered=0, added=0, updated=0,
+                duration_sec=duration, ok=False, error=str(exc),
             )
-            return DiscoverResponse(
-                ok=False,
-                duration_sec=duration,
-                error=str(exc),
-            )
+            return DiscoverResponse(ok=False, duration_sec=duration, error=str(exc))
 
-        # Apply the same two-pass filters as the CLI
         filters_config = load_filters(settings.config_dir)
         kept_jobs, pending_jobs, report_state = apply_scrape_filter(
             jobs, filters_config
         )
 
-        # Pass 2: resolve placeholder locations
         if pending_jobs:
             try:
-                resolved = await source.resolve_pending_locations(pending_jobs)
+                resolved = await source.resolve_pending_locations(
+                    pending_jobs, concurrency=3
+                )
                 extra_kept = apply_location_filter_to_resolved(
                     resolved, report_state
                 )
@@ -494,7 +557,6 @@ def create_app() -> FastAPI:
 
         filter_stats = finalize_filter_report(report_state)
 
-        # Enrich kept jobs with JD details (best effort)
         if kept_jobs:
             try:
                 kept_jobs = await source.enrich_details(kept_jobs)
@@ -512,12 +574,9 @@ def create_app() -> FastAPI:
         )
 
         _record_run(
-            sources=["workday"],
-            discovered=len(jobs),
-            added=added,
-            updated=updated,
-            duration_sec=duration,
-            ok=True,
+            sources=["workday"], discovered=len(jobs),
+            added=added, updated=updated,
+            duration_sec=duration, ok=True,
             filter_report=filter_stats,
         )
 
@@ -538,13 +597,11 @@ def create_app() -> FastAPI:
         from dotenv import load_dotenv
         load_dotenv()
 
-        # Load resume
         try:
             resume = load_resume(settings.resume_file)
         except Exception as exc:
             return ScoreResponse(ok=False, error=f"Resume error: {exc}")
 
-        # Load rubric
         rubric_path = settings.config_dir / "rubric.json"
         if rubric_path.exists():
             rubric = RubricConfig.model_validate(
@@ -553,13 +610,11 @@ def create_app() -> FastAPI:
         else:
             rubric = RubricConfig.default()
 
-        # Build client
         try:
             client = build_client()
         except Exception as exc:
             return ScoreResponse(ok=False, error=str(exc))
 
-        # Run
         try:
             summary = await score_all_jobs(
                 raw_jobs_path=settings.raw_jobs_file,
@@ -570,7 +625,7 @@ def create_app() -> FastAPI:
                 concurrency=concurrency,
                 force=force,
             )
-        except Exception as exc:  # pragma: no cover
+        except Exception as exc:
             logger.error("api_score_failed", error=str(exc))
             return ScoreResponse(ok=False, error=str(exc))
 
@@ -585,7 +640,76 @@ def create_app() -> FastAPI:
             duration_sec=summary.duration_sec,
         )
 
-    # ---------------- Static frontend ----------------
+    @app.get(
+        "/api/applications",
+        tags=["applications"],
+    )
+    async def list_applications() -> dict[str, Application]:
+        return load_applications(APPLICATIONS_FILE)
+
+    @app.get(
+        "/api/applications/stats",
+        response_model=ApplicationStatsResponse,
+        tags=["applications"],
+    )
+    async def application_stats() -> ApplicationStatsResponse:
+        apps = load_applications(APPLICATIONS_FILE)
+        stats = compute_status_stats(apps)
+        return ApplicationStatsResponse(**stats)
+
+    @app.put(
+        "/api/applications/{job_id}",
+        response_model=Application,
+        tags=["applications"],
+    )
+    async def upsert_application(
+        job_id: str,
+        body: ApplicationUpdateRequest,
+    ) -> Application:
+        apps = load_applications(APPLICATIONS_FILE)
+        existing = apps.get(job_id)
+
+        if existing is None:
+            app_record = Application.create(
+                job_id=job_id,
+                status=body.status,
+                note=body.note,
+            )
+            if body.applied_at is not None:
+                app_record.applied_at = body.applied_at
+            if body.notes is not None:
+                app_record.notes = body.notes
+        else:
+            app_record = existing
+            if app_record.status != body.status:
+                app_record.add_transition(
+                    body.status,
+                    note=body.note,
+                    at=body.applied_at if body.applied_at else None,
+                )
+            if body.applied_at is not None:
+                app_record.applied_at = body.applied_at
+            if body.notes is not None:
+                app_record.notes = body.notes
+                app_record.updated_at = datetime.now(timezone.utc)
+
+        await asyncio.to_thread(save_application, APPLICATIONS_FILE, app_record)
+        return app_record
+
+    @app.delete(
+        "/api/applications/{job_id}",
+        tags=["applications"],
+    )
+    async def remove_application(job_id: str) -> dict[str, Any]:
+        removed = await asyncio.to_thread(
+            delete_application, APPLICATIONS_FILE, job_id
+        )
+        if not removed:
+            raise HTTPException(
+                status_code=404,
+                detail=f"No application tracked for {job_id}",
+            )
+        return {"ok": True, "job_id": job_id}
 
     @app.get("/", include_in_schema=False)
     async def index():

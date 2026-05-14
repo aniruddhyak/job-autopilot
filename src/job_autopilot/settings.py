@@ -70,6 +70,9 @@ class Settings(BaseSettings):
             return scoring
         return self.data_dir / "resume.md"
 
+    @property
+    def applications_file(self) -> Path:
+        return self.data_dir / "applications.json"
 
 # Module-level singleton — import this anywhere
 settings = Settings()

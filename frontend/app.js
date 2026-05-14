@@ -86,6 +86,151 @@ function topScoreBadge(score, recommendation) {
 }
 
 // ---------------------------------------------------------------------
+// Status (application) helpers
+// ---------------------------------------------------------------------
+
+const STATUS_META = {
+  interested: { label: 'Interested', icon: '★', cls: 'status-interested' },
+  applied:    { label: 'Applied',    icon: '✓', cls: 'status-applied' },
+  interview:  { label: 'Interview',  icon: '📞', cls: 'status-interview' },
+  offer:      { label: 'Offer',      icon: '🎉', cls: 'status-offer' },
+  rejected:   { label: 'Rejected',   icon: '✗', cls: 'status-rejected' },
+};
+
+function statusPill(application, jobId) {
+  if (!application) {
+    return `
+      <button class="status-pill status-untracked" data-job-id="${escapeHtml(jobId)}" title="Set status">
+        <span class="status-text">Mark</span>
+        <span class="status-caret">▾</span>
+      </button>
+    `;
+  }
+  const meta = STATUS_META[application.status] || STATUS_META.applied;
+  const dateBit = application.applied_at
+    ? ` <span class="status-date">(${shortDate(application.applied_at)})</span>`
+    : '';
+  return `
+    <button class="status-pill ${meta.cls}" data-job-id="${escapeHtml(jobId)}" title="Edit status">
+      <span class="status-icon">${meta.icon}</span>
+      <span class="status-text">${meta.label}${dateBit}</span>
+      <span class="status-caret">▾</span>
+    </button>
+  `;
+}
+
+function shortDate(iso) {
+  if (!iso) return '';
+  const d = new Date(iso);
+  return `${d.getMonth() + 1}/${d.getDate()}`;
+}
+
+async function setStatus(jobId, status, note = '') {
+  if (status === '__clear__') {
+    const r = await fetch(API + `/applications/${encodeURIComponent(jobId)}`, {
+      method: 'DELETE',
+    });
+    if (!r.ok && r.status !== 404) {
+      throw new Error(`Delete failed: ${r.status}`);
+    }
+    return null;
+  }
+  const body = { status, note };
+  const r = await fetch(API + `/applications/${encodeURIComponent(jobId)}`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  if (!r.ok) {
+    const txt = await r.text();
+    throw new Error(`Update failed: ${r.status} ${txt}`);
+  }
+  return r.json();
+}
+
+// Popup menu — created lazily, only one at a time
+let activeMenu = null;
+
+function closeStatusMenu() {
+  if (activeMenu) {
+    activeMenu.remove();
+    activeMenu = null;
+  }
+}
+
+function openStatusMenu(pillBtn) {
+  closeStatusMenu();
+  const jobId = pillBtn.dataset.jobId;
+  const rect = pillBtn.getBoundingClientRect();
+
+  const menu = document.createElement('div');
+  menu.className = 'status-menu';
+  menu.innerHTML = `
+    <button data-status="interested"><span>★</span> Interested</button>
+    <button data-status="applied"><span>✓</span> Applied</button>
+    <button data-status="interview"><span>📞</span> Interview</button>
+    <button data-status="offer"><span>🎉</span> Offer</button>
+    <button data-status="rejected"><span>✗</span> Rejected</button>
+    <div class="status-menu-sep"></div>
+    <button data-status="__clear__" class="status-menu-clear">Clear status</button>
+  `;
+  menu.style.position = 'fixed';
+  menu.style.top = `${rect.bottom + 4}px`;
+  menu.style.left = `${rect.left}px`;
+  document.body.appendChild(menu);
+  activeMenu = menu;
+
+  menu.querySelectorAll('button').forEach((btn) => {
+    btn.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      const status = btn.dataset.status;
+      closeStatusMenu();
+      try {
+        await setStatus(jobId, status);
+        // Update the local job in memory so the row re-renders correctly
+        const job = currentJobs.find((j) => j.id === jobId);
+        if (job) {
+          if (status === '__clear__') {
+            job.application = null;
+          } else {
+            const now = new Date().toISOString();
+            const existing = job.application || {};
+            job.application = {
+              ...existing,
+              job_id: jobId,
+              status,
+              applied_at: existing.applied_at ||
+                (status === 'applied' ? now : existing.applied_at),
+              updated_at: now,
+            };
+          }
+        }
+        rerenderJobsTable();
+        showToast(`Status: ${status === '__clear__' ? 'cleared' : status}`, 'success', 1500);
+      } catch (err) {
+        showToast(`Failed: ${err.message}`, 'error', 4000);
+      }
+    });
+  });
+}
+
+// Click outside closes menu
+document.addEventListener('click', (e) => {
+  if (
+    activeMenu &&
+    !activeMenu.contains(e.target) &&
+    !(e.target.closest && e.target.closest('.status-pill'))
+  ) {
+    closeStatusMenu();
+  }
+});
+
+// Escape closes menu
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') closeStatusMenu();
+});
+
+// ---------------------------------------------------------------------
 // Filtering / sorting
 // ---------------------------------------------------------------------
 
@@ -150,7 +295,7 @@ function rerenderJobsTable() {
 
   if (filtered.length === 0) {
     tbody.innerHTML = `
-      <tr><td colspan="6" class="empty" style="padding: 32px;">
+      <tr><td colspan="7" class="empty" style="padding: 32px;">
         No jobs match your filters.
       </td></tr>`;
     return;
@@ -202,7 +347,7 @@ function rerenderJobsTable() {
         : '';
       detailRow = `
         <tr class="detail-row" id="${detailId}" hidden>
-          <td colspan="6" class="detail-cell">
+          <td colspan="7" class="detail-cell">
             ${matchSection}
             ${jd}
           </td>
@@ -216,12 +361,14 @@ function rerenderJobsTable() {
         <td class="cell-title">${escapeHtml(j.title)}</td>
         <td class="cell-muted location-cell">${formatLocations(j.location)}</td>
         <td class="cell-muted">${escapeHtml(j.posted_on || '—')}</td>
+        <td class="cell-status">${statusPill(j.application, j.id)}</td>
         <td class="arrow">↗</td>
       </tr>
       ${detailRow}`;
   }).join('');
 
   // Expanders
+  // Wire up expanders
   $$('#view .expand-btn').forEach((btn) => {
     btn.addEventListener('click', (e) => {
       e.stopPropagation();
@@ -233,9 +380,20 @@ function rerenderJobsTable() {
     });
   });
 
-  // Row clicks
+  // Status pill clicks (must come before row click handler, and stopPropagation)
+  $$('#view .status-pill').forEach((btn) => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      openStatusMenu(btn);
+    });
+  });
+
+  // Row clicks - skip if the click was on a button/menu
   $$('#view tr.clickable').forEach((row) => {
-    row.addEventListener('click', () => {
+    row.addEventListener('click', (e) => {
+      if (e.target.closest('.status-pill') || e.target.closest('.expand-btn')) {
+        return;
+      }
       window.open(row.dataset.url, '_blank', 'noopener,noreferrer');
     });
   });
@@ -429,6 +587,7 @@ async function renderCompanyJobs(companyId) {
           <th>Title</th>
           <th>Location</th>
           <th>Posted</th>
+          <th>Status</th>
           <th></th>
         </tr>
       </thead>
